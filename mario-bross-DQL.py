@@ -5,14 +5,14 @@ import numpy as np
 
 from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT
 from matplotlib import pyplot as plt
 
 import torchvision
 from collections import deque
 
-env = gym_super_mario_bros.make('SuperMarioBros-v0')
-env = JoypadSpace(env, SIMPLE_MOVEMENT)
+env = gym_super_mario_bros.make('SuperMarioBrosRandomStages-v0')
+env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
 class ReplayBuffer:
 
@@ -54,27 +54,27 @@ class DQN(torch.nn.Module):
         super(DQN, self).__init__()
 
         self.feature_extractor = torch.nn.Sequential(
-            torch.nn.Conv2d(4, 32, kernel_size=8, stride=2),
+            torch.nn.Conv2d(4, 32, kernel_size=8, stride=4),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(32, 32, kernel_size=4, stride=1),
+            torch.nn.Conv2d(32, 64, kernel_size=4, stride=2),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(32, 64, kernel_size=3, stride=1),
+            torch.nn.Conv2d(64, 64, kernel_size=3, stride=1),
             torch.nn.ReLU()
         )
 
         self.best_model = None
         self.bootstrap = 0
-        self.fc1 = torch.nn.Linear(7*8*64, 256)
-        self.fc2 = torch.nn.Linear(256, env.action_space.n)
+        self.fc1 = torch.nn.Linear(3136, 512)
+        self.fc2 = torch.nn.Linear(512, env.action_space.n)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.criterion = torch.nn.MSELoss()
+        self.criterion = torch.nn.SmoothL1Loss()
         self.to(device)
         self.device = device
 
     def forward(self, x):
         x = self.feature_extractor(x.to(self.device))
-        x = x.reshape(-1, 7*8*64)
+        x = x.reshape(-1, 3136)
         x = torch.nn.functional.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -92,7 +92,7 @@ def pick_action(q_values, epsilon):
 def preprocess_state(state):
     state = torch.tensor(state.copy()).float().permute(2,0,1)
 
-    state = torchvision.transforms.Resize(size=30)(state)
+    state = torchvision.transforms.Resize(size=84)(state)
 
     state /= 255.0
     state = state.max(dim=0, keepdim=True).values
@@ -101,13 +101,15 @@ def preprocess_state(state):
 done = True
 Q = DQN()
 Q_prime = DQN()
-episodes = 100
+episodes = 15000
 iterations = 10000
-bootstrap = 100
-epsilon = 0.05
-lr = 0.0001
-buffer_size = 1000
-batch_size = 256
+bootstrap = 1e4
+epsilon = 1
+epsilon_decay = 0.9999
+epsilon_min = 0.05
+lr = 0.00025
+buffer_size = int(1e5)
+batch_size = 32
 
 gamma = 0.99
 
@@ -120,11 +122,10 @@ losses_history = []
 optimizer = Q.make_optimizer(lr)
 
 buffer = None
+mean_rwh = []
 
-
-for episode in range(episodes):
-
-    print(f'Episode: {episode}')
+iter = tqdm(range(episodes))
+for episode in iter:
 
     scenes = deque(maxlen=4)
     prev_state = preprocess_state(env.reset())
@@ -137,9 +138,8 @@ for episode in range(episodes):
             scenes.append(prev_state)
     
     last_x_pos = 0
-    iter = tqdm(range(iterations))
     rewards_history = []
-    for iteration in iter:
+    for iteration in range(iterations):
 
         scenes.append(prev_state)
 
@@ -147,12 +147,16 @@ for episode in range(episodes):
 
         with torch.no_grad():
             q_values = Q(prev_state.unsqueeze(0))
+            epsilon = max(epsilon*epsilon_decay, epsilon_min)
             act = pick_action(q_values.detach(), epsilon)
         
         rw = []
         for k in range(5):
             state, reward, done, info = env.step(act)
             rw.append(reward)
+            if reward < -13:
+                done = True
+                
             if done:
                 break   
         
@@ -165,6 +169,7 @@ for episode in range(episodes):
       
         if buffer is None:
             buffer = ReplayBuffer(buffer_size, prev_state.shape)
+
         buffer.store_transition(prev_state, act, reward, new_state, not done)
 
         if buffer is not None and buffer.mem_cntr >= batch_size :
@@ -173,9 +178,9 @@ for episode in range(episodes):
             q_values = Q(prev_states)
             q_start_values = Q_prime(states).detach().max(dim=-1, keepdim=True).values
 
-            mask = torch.functional.F.one_hot(actions, env.action_space.n).to(Q.device)
+            # mask = torch.functional.F.one_hot(actions, env.action_space.n).to(Q.device)
 
-            loss = Q.criterion(rewards.to(Q.device) + gamma*dones.to(Q_prime.device)*q_start_values, torch.sum(q_values*mask, axis=-1, keepdim=True))
+            loss = Q.criterion(rewards.to(Q.device) + gamma*dones.to(Q_prime.device)*q_start_values, q_values.gather(1, actions.long().to(Q.device).unsqueeze(-1)) ) #torch.sum(q_values*mask, axis=-1, keepdim=True))
             Q.bootstrap += 1
 
             losses_history.append(loss.item())
@@ -194,32 +199,29 @@ for episode in range(episodes):
                     print(f'Best reward: {Q.best_model:.3f}')
                 torch.save(Q_prime.state_dict(), 'Q_target.pt')
 
-            if Q.best_model is not None and Q.best_model < info['x_pos']:
-                torch.save(Q.state_dict(), 'Q_target_best.pt')
-                print(f'Best reward: {Q.best_model:.3f}')
-                Q.best_model = info['x_pos']
+            # if Q.best_model is not None and Q.best_model < info['x_pos']:
+            #     torch.save(Q.state_dict(), 'Q_target_best.pt')
+            #     Q.best_model = info['x_pos']
             
         prev_state = state
 
         if iteration and iteration%max_time_for_dist == 0:
             if info['x_pos'] - last_x_pos < min_dist_req:
                 done = True
-                print('too slow')
             else:
                 last_x_pos = info['x_pos']
-
         if done:
-            break
-        iter.set_postfix_str(f'epsilon: {epsilon:.3f} reward: {np.sum(rewards_history):.3f} x_pos: {info["x_pos"]:.3f}')
-
-    mean_rwh = np.sum(rewards_history)
+             break
+    mean_rwh += [np.sum(rewards_history)]
+    iter.set_postfix_str(f'epsilon: {epsilon:.3f} mean_reward: {np.mean(mean_rwh[-100:]):.3f} reward: {np.sum(rewards_history):.3f} best: {Q.best_model if Q.best_model is not None else 0:.3f}')
+    #delete line console
     # if Q.best_model is None or Q.best_model < mean_rwh:
     #     Q.best_model = mean_rwh
     #     torch.save(Q.state_dict(), 'Q_target_best.pt')
     #     print(f'Best reward: {Q.best_model:.3f}')
 env.close()
 
-plt.plot(losses_history)
+plt.plot(mean_rwh)
 plt.show()
      # %%
 
