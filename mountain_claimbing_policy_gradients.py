@@ -45,15 +45,15 @@ class ReplayBuffer:
 
         return states, actions, rewards, states_, dones
 
-class DQN(torch.nn.Module):
+class PModel(torch.nn.Module):
     def __init__(self):
-        super(DQN, self).__init__()
+        super(PModel, self).__init__()
 
         self.bootstrap = 0
         self.fc1 = torch.nn.Linear(2, 32)
         self.fc2 = torch.nn.Linear(32, env.action_space.n)
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         self.criterion = torch.nn.MSELoss()
         self.to(device)
         self.device = device
@@ -67,34 +67,62 @@ class DQN(torch.nn.Module):
     
     def make_optimizer(self, lr):
         return torch.optim.Adam(self.parameters(), lr=lr)
-    
-def pick_action(q_values, epsilon):
 
-    if torch.rand(1) < epsilon:
-        return env.action_space.sample()
-    else:
-        return torch.argmax(q_values).item()
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path):
+        self.load_state_dict(torch.load(path))
+    
+class DVN(PModel):
+
+    def __init__(self):
+        super(DVN, self).__init__()
+
+        self.bootstrap = 0
+        self.fc1 = torch.nn.Linear(2, 32)
+        self.fc2 = torch.nn.Linear(32, 1)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        self.criterion = torch.nn.MSELoss()
+        self.to(device)
+        self.device = device
+    
+    def forward(self, x):
+        
+        x = torch.nn.functional.relu(self.fc1(x.to(self.device)))
+        x = self.fc2(x)
+        return x
+    
+    def make_optimizer(self, lr):
+        return torch.optim.Adam(self.parameters(), lr=lr)
+
+def pick_action(preferences):
+
+    preferences = torch.nn.functional.softmax(preferences, dim=-1)
+    action = torch.multinomial(preferences, 1)
+  
+    return action.item()
 
 done = True
-Q = DQN()
-Q_prime = DQN()
-episodes = 1000
+V = DVN()
+P = PModel()
+
+episodes = 100
 iterations = 1000
 bootstrap = 50
-epsilon = 0.05
 lr = 0.001
 buffer_size = 100
 batch_size = 32
 
 gamma = 0.99
 
-min_dist_req = 40
-max_time_for_dist = 100
-
 rewards_history = []
-losses_history = []
+losses_history_q = []
+losses_history_p = []
 
-optimizer = Q.make_optimizer(lr)
+optimizer_vfunction = V.make_optimizer(lr)
+optimizer_pfunction = P.make_optimizer(lr)
 
 buffer = None
 episodes = tqdm(range(episodes))
@@ -112,12 +140,12 @@ for episode in episodes:
     for iteration in tqdm(range(iterations)):
 
         with torch.no_grad():
-            q_values = Q(prev_state.unsqueeze(0))
-            act = pick_action(q_values.detach(), epsilon)
+            v_values = V(prev_state.unsqueeze(0))
+            preferences = P(prev_state.unsqueeze(0))
+            act = pick_action(preferences.detach())
 
         state, reward, done,_, info = env.step(act)
         rewards_history.append(reward)
-
         state = preprocess_state(state)
       
         if buffer is None:
@@ -127,32 +155,73 @@ for episode in episodes:
         if buffer is not None and buffer.mem_cntr >= batch_size :
             
             prev_states, actions, rewards, states, dones = buffer.sample_buffer(batch_size)
-            q_values = Q(prev_states)
-            q_start_values = Q_prime(states).detach().max(dim=-1, keepdim=True).values
-
-            mask = torch.functional.F.one_hot(actions, env.action_space.n).to(Q.device)
-
-            loss = Q.criterion(rewards.to(Q.device) + gamma*dones.to(Q_prime.device)*q_start_values, torch.sum(q_values*mask, axis=-1, keepdim=True))
-            Q.bootstrap += 1
-
-            losses_history.append(loss.item())
+            v_values = V(prev_states)
+            v_values_1 = V(states).detach()
             
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            preferences = P(prev_states)
+            mask = torch.functional.F.one_hot(actions, env.action_space.n).to(V.device)
 
-            if Q.bootstrap >= bootstrap:
-                Q_prime.load_state_dict(Q.state_dict())
-                torch.save(Q_prime.state_dict(), 'Q_target.pt')
+            log_p_values = torch.log(torch.functional.F.softmax(preferences, dim=-1))
+            log_p_values = (mask*log_p_values).sum(axis=-1, keepdim=True)
+
+            loss_q = V.criterion(rewards.to(V.device) + gamma*dones.to(V.device)*v_values_1, v_values)
+            
+            td0 = rewards.to(V.device) + gamma*dones.to(V.device)*v_values_1 - v_values
+            loss_p = (td0.detach()*log_p_values).mean()
+            V.bootstrap += 1
+
+            losses_history_q.append(loss_q.item())
+            losses_history_p.append(loss_p.item())
+            
+            loss_q.backward()
+            loss_p.backward()
+
+            optimizer_pfunction.step()
+            optimizer_pfunction.zero_grad()
+
+            optimizer_vfunction.step()
+            optimizer_vfunction.zero_grad()
+
+            if V.bootstrap >= bootstrap:
+                torch.save(V.state_dict(), 'V_target.pt')
+                torch.save(P.state_dict(), 'P.pt')
             
         prev_state = state
 
         if done:
             break
-    episodes.set_postfix_str(f'epsilon: {epsilon:.3f} reward: {np.mean(rewards_history[-100:]):.3f}')
+    episodes.set_postfix_str(f'reward: {np.mean(rewards_history[-100:]):.3f}')
 env.close()
 
-plt.plot(losses_history)
-plt.show()
-     # %%
+plt.plot(losses_history_q, label='V function')
+plt.plot(losses_history_p, label='P function')
 
+plt.show()
+ # %%
+
+# Q.load('Q_target.pt')
+# P.load('P.pt')
+
+env = gym.make('MountainCar-v0', render_mode='human')
+prev_state, info = env.reset()
+prev_state = preprocess_state(prev_state)
+
+for _ in range(int(1e4)):
+
+    action = pick_action(P(prev_state.unsqueeze(0)))
+
+    observation, reward, terminated, _, _ = env.step(action)
+    print(action)
+
+    prev_state = preprocess_state(observation)
+    prev_action = action
+
+    if terminated:
+        break
+
+env.close()
+
+
+# %%
+
+# %%
