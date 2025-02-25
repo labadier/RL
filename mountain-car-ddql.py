@@ -8,7 +8,7 @@ from matplotlib import pyplot as plt
 
 from collections import deque
 
-env = gym.make('MountainCar-v0')
+env = gym.make('MountainCar-v0', render_mode='human')
 
 class ReplayBuffer:
 
